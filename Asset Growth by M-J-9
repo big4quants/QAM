@@ -1,0 +1,341 @@
+library(readr)
+library(data.table)
+library(DataAnalytics)
+library(lubridate)
+library(dplyr)
+library(zoo)
+library(moments)
+library(readxl)
+setwd("C:/Users/mulin/Desktop/MFE Spring 2019/Quant Asset Management/Final")
+
+Compustat_fundamental <- read_csv("Compustat_fundamental.csv")
+Compustat_earning <- read_csv("Compustat_earning.csv")
+CRSP <- read.csv("CRSP size data.csv")
+Linking <- read_csv("C:/Users/mulin/Desktop/MFE Spring 2019/Quant Asset Management/PS4/Linking.csv")
+
+Compustat_fundamental <- as.data.table(Compustat_fundamental)
+Compustat_earning <- as.data.table(Compustat_earning)
+CRSP <- as.data.table(CRSP)
+Linking <- as.data.table(Linking)
+
+#----------------------------------------- PART I CRSP -----------------------------------------
+## CRSP cleaning, same routine as before
+CRSP <- unique(CRSP)
+CRSP <- CRSP[(SHRCD %in% c(10, 11)) & (EXCHCD %in% c(1,2,3)),]
+CRSP <- CRSP[SICCD %in% c(0:6000) || SICCD %in% c(7000:9999)] #excluding firms with SIC between 6000 and 6999
+
+CRSP[,date:= mdy(date)]
+CRSP[,year:= year(date)] #month column
+CRSP[,month:= month(date)] #month column
+
+CRSP[, RET := as.numeric(as.character(RET))]
+CRSP[, DLRET := as.numeric(as.character(DLRET))]
+CRSP[, PRC := abs(as.numeric(as.character(PRC)))]
+CRSP[, SHROUT := as.numeric(as.character(SHROUT))]
+
+CRSP[, `:=`(cumDivRet, ifelse(is.na(DLRET),RET,ifelse(is.na(RET), DLRET, (1+DLRET)*(1+RET)-1 )))]
+CRSP[, `:=`(ME, abs(PRC * SHROUT / 1000))] # in 1mm
+CRSP[,lag_ME := shift(ME),by = PERMNO]
+
+##calculate the size ME
+# this gives half year of ME from Jun t-1 and half year of Me from Jun t
+CRSP[,size_ME := lag_ME[month == 7],by = .(PERMNO,year)]
+CRSP[,size_ME := shift(size_ME,n=6),by = PERMNO]
+
+##calculate the ME of last december 
+CRSP[,Dec_ME := lag_ME[month == 1], by = .(PERMNO,year)]
+CRSP[,Dec_ME := shift(Dec_ME,n=6),by = PERMNO]
+
+
+#----------------------------------------- PART II LINKING -----------------------------------------
+## to clean the LINKING rable
+Linking[,LINKDT:=ymd(LINKDT)]
+Linking[,yearStart:= year(LINKDT)]
+Linking=Linking[LINKPRIM == 'C'|LINKPRIM == 'P',]
+Linking=Linking[LINKTYPE == 'LU'|LINKTYPE == 'LC',]
+Linking[,yearEnd:=ifelse(LINKENDDT=="E",year(ymd("20181231")),year(ymd(LINKENDDT)))]
+Linking[,PERMCO:= LPERMCO]
+Linking[,PERMNO:= LPERMNO]
+
+CRSP_Linking <- merge(CRSP, Linking, by="PERMNO",allow.cartesian = T,all.x = T)
+CRSP_Linking[,flag := (year<= yearEnd) & (year >= yearStart)]
+CRSP_Linking <- CRSP_Linking[flag==TRUE,]
+
+CRSP_Linking <- CRSP_Linking[,.(year, month, PERMNO, EXCHCD, PERMCO=PERMCO.x, cumDivRet, lag_ME, size_ME, Dec_ME, gvkey)]
+
+# to add subsidiaries under same PERMCO
+setkey(CRSP_Linking,PERMCO,PERMNO,year,month)
+CRSP_Linking[,size_ME := sum(size_ME),by = .(PERMCO,year,month)]
+CRSP_Linking[,Dec_ME := sum(Dec_ME),by = .(PERMCO,year,month)]
+
+
+#----------------------------------------- PART III COMPUSTATS -----------------------------------------
+Compustats[,Year:= fyear] # note this is fiscal year
+Compustats <- Compustats[indfmt=="INDL"] # non-financial firm
+
+# to merge with LINKING
+compustats_Linking <- merge(Compustats, Linking, by="gvkey",allow.cartesian = T,all.x = T)
+compustats_Linking[,flag := (Year<= yearEnd) & (Year >= yearStart)]
+compustats_Linking <- compustats_Linking[flag==TRUE,]
+
+compustats_Linking <- compustats_Linking[,.(gvkey, year=Year, PERMCO, PERMNO, ASSETS=at)]
+
+
+
+
+#----------------------------------------- PART III COMPUSTATS -----------------------------------------
+## To get book value as per defined BE = SHE - PS + DT - PRBA
+# SHE = SEQ, or CEQ + PSTK, or AT - LT - MIB, or AT - LT
+# coalesce to find the first non-missing value
+Compustats_1973[,SHE:= coalesce(seq, ceq + pstk, at - lt - mib, at - lt)]
+#merged_compustats <- merged_compustats[!is.na(SHE)]
+
+# PS = PSTKRV, or PSTKL, or PSTK
+Compustats_1973[,PS:= coalesce(pstkrv, pstkl, pstk)]
+
+# DT = TXDITC, or ITCB, or TXDB
+Compustats_1973[,DT:= coalesce(txditc, itcb, txdb)]
+
+# to merge pension into compustats data
+# format date
+Pension[,datadate:= mdy(datadate)]
+Pension[, Year:= year(datadate)]
+Compustats_1973[,Year:= fyear] # note this is fiscal year
+merged_compustats <- merge(Compustats_1973,Pension,by=c("gvkey","Year","indfmt"))
+merged_compustats <- merged_compustats[,.(gvkey, Year, indfmt, SHE, PS, DT, PRBA=prba)]
+
+# BE = SHE - PS + DT - PRBA
+#merged_compustats[,BE := shift(mapply(function(a,b,c,d) return(sum(a,-b,c,-d, na.rm=T)),SHE,PS,DT,PRBA)),by = gvkey]
+merged_compustats[, BE:= shift(ifelse(is.na(PRBA), (SHE-PS+DT), (SHE-PS+DT-PRBA))),by = gvkey] # treat PRBA as 0 prior to 1993
+
+
+# to merge with LINKING
+compustats_Linking <- merge(merged_compustats, Linking, by="gvkey",allow.cartesian = T,all.x = T)
+compustats_Linking[,flag := (Year<= yearEnd) & (Year >= yearStart)]
+compustats_Linking <- compustats_Linking[flag==TRUE,]
+
+# only want INDL firm, non-Fs
+compustats_Linking <- compustats_Linking[indfmt=="INDL"]
+compustats_Linking <- compustats_Linking[,.(gvkey, year=Year, PERMCO, PERMNO, BE)]
+
+
+
+#----------------------------------------- PART IV Merge CRSP and COMPUSTATS -----------------------------------------
+# final merge
+master_data <- merge(CRSP_Linking, compustats_Linking, by=c("PERMCO","gvkey","year","PERMNO"), allow.cartesian = T, all= T)
+master_data <- unique(master_data)
+master_data <- master_data[!is.na(cumDivRet),]
+master_data <- master_data[!is.na(lag_ME),]
+
+# include only firms with at least 5 year of accounting data
+master_data[,flag:=ifelse(length(year)<6,0,1), by=PERMNO]
+master_data <- master_data[flag==1]
+master_data <- master_data[ASSETS!=0]
+
+# 6month gap
+setkey(master_data,year,month)
+
+master_data[,ASSETS:= sum(ASSETS), by= c("PERMCO","year","month")]
+
+master_data[, ASSETG := shift(ASSETS,1)/shift(ASSETS,2) - 1, by = list(PERMNO, month)]
+master_data[,ASSETG_sort := shift(ASSETG,n=6), by = "PERMNO"] # shift 6 month as we form portfolio in June
+
+master_data[, L2ASSETG := shift(ASSETG), by = list(PERMNO, month)]
+master_data[,L2ASSETG_sort := shift(L2ASSETG,n=6), by = gvkey] # shift 6 month as we form portfolio in June
+
+
+#----------------------------------------- PART V Portfolio Construction -----------------------------------------
+### sort size on NYSE
+master_data <- master_data[!is.na(size_ME) & size_ME!=0]
+master_data[,size_decile := findInterval(size_ME, quantile(size_ME[EXCHCD==1], seq(.1,.9,.1)), left.open = T) + 1,by = .(year,month)]
+#master_data[,size_decile:= cut(size_ME, breaks = quantile(size_ME[EXCHCD==1],probs=c(0:10)/10, type=5), labels = FALSE), by=c("year","month")]
+
+# size broken by 30-70 percentiles(on NYSE stocks)
+master_data[,SB:=ifelse(size_decile<4,"S",ifelse(size_decile<8,"M","B"))]
+
+# to create decile portfolio based on size_sort
+size_port <- master_data[,list(vw_ret = weighted.mean(cumDivRet, lag_ME, na.rm=TRUE), 
+                       ew_ret = mean(cumDivRet, na.rm = T)), by = c("year","month","size_decile")]
+
+
+
+
+### ASSETG
+master_data <- master_data[!is.na(ASSETG_sort)]
+master_data[,ASSETG_decile :=findInterval(ASSETG_sort, quantile(ASSETG_sort, seq(.1,.9,.1)), left.open = T) + 1,by = .(year, month)]
+
+# to create portfolio based on ASSETG_decile
+ASSETG_port <- master_data[,list(vw_ret = weighted.mean(cumDivRet, lag_ME, na.rm =T), 
+                                 ew_ret = mean(cumDivRet, na.rm = T)), by = c("year","month","ASSETG_decile")]
+
+# to create portfolio double sorted on ASSETG_decile and SMB
+SMB_ASSETG_port <- master_data[,list(vw_ret = weighted.mean(cumDivRet, lag_ME, na.rm=TRUE), 
+                              ew_ret = mean(cumDivRet, na.rm = T)), by = c("year","month","ASSETG_decile","SB")]
+
+
+#----------------------------------------- Table I, Panel A -----------------------------------------
+ASSETG_data <- master_data[year<-2004 & year >1967]
+
+table1 <- ASSETG_data[,list(mean_growth = mean(ASSETG_sort, na.rm =T), mean_l2growth = mean(L2ASSETG_sort, na.rm =T),
+                            mean_asset = mean(ASSETS, na.rm =T)/100), by = "ASSETG_decile"]
+
+print(table1)
+
+
+
+
+#----------------------------------------- Cum return -----------------------------------------
+#VW
+ASSETG_VW <- dcast(ASSETG_port, year+month ~ ASSETG_decile, value.var = 'vw_ret')
+FF <- FF_3_factor[year>1967, -c(3,4)]
+FF <- FF[year<2019]
+VW <- merge(ASSETG_VW, FF, by=c('year', 'month'))
+VW$spread <- VW$`1`-VW$`10`
+
+ave <- colMeans(VW[,c(3:12,16)],na.rm = T)*12
+sd <- sapply(VW[,c(3:12,16)], sd, na.rm = T)*sqrt(12)
+sp <- ave/sd
+
+VW_stat <- data.frame(rbind(ave,sd,sp), row.names = c("mean","vol","sharpe ratio"))
+
+#EW
+ASSETG_EW <- dcast(ASSETG_port, year+month ~ ASSETG_decile, value.var = 'ew_ret')
+EW <- merge(ASSETG_EW, FF, by=c('year', 'month'))
+EW$spread <- EW$`1`-EW$`10`
+
+ave <- colMeans(EW[,c(3:12,16)],na.rm = T)*12
+sd <- sapply(EW[,c(3:12,16)], sd, na.rm = T)*sqrt(12)
+sp <- ave/sd
+
+EW_stat <- data.frame(rbind(ave,sd,sp), row.names = c("mean","vol","sharpe ratio"))
+
+
+VW <- as.data.table(VW)
+VW_cum <- cumprod(1+VW[year>2007,"spread"])
+#EW <- as.data.table(EW)
+#EW_cum <- cumprod(1+EW[year>2007,"Ex_Port"])
+Mkt_cum <- cumprod(1+VW[year>2007,"ExMkt"])
+time <- seq.Date(as.Date("2008/1/1"), by = "month", length = 132)
+
+plot(ylab="Cumulative Return", ylim = c(0, 3), x=time, y=VW_cum$spread, type ="l", main = "Asset Growth VS Market Portfolio (2008-2018)")
+lines(x =time, y= Mkt_cum$ExMkt, col ="red")
+legend("topleft",legend=c("WML", "mkt"),fill=c("black","red"), cex = 0.8)
+
+
+
+#----------------------------------------- Table II, Panel C1 & C2 -----------------------------------------
+setwd("C:/Users/mulin/Desktop/MFE Spring 2019/Quant Asset Management/Final project/")
+
+FF_3_factor <- read_excel("FF 3 Factor Monthly Return.xlsx")
+colnames(FF_3_factor) <- c("date", "ExMkt", "SMB", "HML", "RF")
+FF_3_factor <- data.frame(FF_3_factor)
+FF_3_factor[,c(2:5)] <- FF_3_factor[,c(2:5)]/100
+FF_3_factor <- data.table(FF_3_factor)
+FF_3_factor[,date := paste0(date,"01")]
+FF_3_factor[,year:= year(ymd(date))]
+FF_3_factor[,month:= month(ymd(date))]
+
+table_C1 <- table_C2 <- matrix(0,4,11)
+for(i in 1:10){
+  temp1 <- SMB_ASSETG_port[ASSETG_decile==i & year %in% c(1968:1980) & SB %in% "S"]
+  temp2 <- SMB_ASSETG_port[ASSETG_decile==i & year %in% c(1968:1980) & SB %in% "M"]
+  temp3 <- SMB_ASSETG_port[ASSETG_decile==i & year %in% c(1968:1980) & SB %in% "B"]
+  temp4 <- ASSETG_port[ASSETG_decile==i & year %in% c(1968:1980)] # all firms, single sort
+  FF <- FF_3_factor[year %in% c(1968:1980)]
+  
+  table_C1[1,i] <- lm(temp1$ew_ret~FF$ExMkt + FF$SMB + FF$HML)$coef[1]
+  table_C1[2,i] <- lm(temp2$ew_ret~FF$ExMkt + FF$SMB + FF$HML)$coef[1]
+  table_C1[3,i] <- lm(temp3$ew_ret~FF$ExMkt + FF$SMB + FF$HML)$coef[1]
+  table_C1[4,i] <- lm(temp4$ew_ret~FF$ExMkt + FF$SMB + FF$HML)$coef[1]
+  
+  table_C2[1,i] <- lm(temp1$vw_ret~FF$ExMkt + FF$SMB + FF$HML)$coef[1]
+  table_C2[2,i] <- lm(temp2$vw_ret~FF$ExMkt + FF$SMB + FF$HML)$coef[1]
+  table_C2[3,i] <- lm(temp3$vw_ret~FF$ExMkt + FF$SMB + FF$HML)$coef[1]
+  table_C2[4,i] <- lm(temp4$vw_ret~FF$ExMkt + FF$SMB + FF$HML)$coef[1]
+}
+
+table_C1[,11] <- table_C1[,10] - table_C1[,1]
+colnames(table_C1) <- c("decile 1", "decile 2", "decile 3", "decile 4","decile 5","decile 6","decile 7","decile 8","decile 9","decile 10","spread")
+rownames(table_C1) <- c("Small size","Medium size","Large size", "All firms")
+
+table_C2[,11] <- table_C2[,10] - table_C2[,1]
+colnames(table_C2) <- c("decile 1", "decile 2", "decile 3", "decile 4","decile 5","decile 6","decile 7","decile 8","decile 9","decile 10","spread")
+rownames(table_C2) <- c("Small size","Medium size","Large size", "All firms")
+
+print(table_C1) # ewret
+print(table_C2) # vwret
+
+
+
+#----------------------------------------- Table II, Panel D1 & D2 -----------------------------------------
+table_D1 <- table_D2 <- matrix(0,3,11)
+for(i in 1:10){
+  temp1 <- ASSETG_port[ASSETG_decile==i & year %in% c(1968:1980)]
+  temp2 <- ASSETG_port[ASSETG_decile==i & year %in% c(1981:1990)]
+  temp3 <- ASSETG_port[ASSETG_decile==i & year %in% c(1991:2003)]
+  FF1 <- FF_3_factor[year %in% c(1968:1980)]
+  FF2 <- FF_3_factor[year %in% c(1981:1990)]
+  FF3 <- FF_3_factor[year %in% c(1991:2003)]
+  
+  table_D1[1,i] <- lm(temp1$ew_ret~FF1$ExMkt + FF1$SMB + FF1$HML)$coef[1]
+  table_D1[2,i] <- lm(temp2$ew_ret~FF2$ExMkt + FF2$SMB + FF2$HML)$coef[1]
+  table_D1[3,i] <- lm(temp3$ew_ret~FF3$ExMkt + FF3$SMB + FF3$HML)$coef[1]
+  
+  table_D2[1,i] <- lm(temp1$vw_ret~FF1$ExMkt + FF1$SMB + FF1$HML)$coef[1]
+  table_D2[2,i] <- lm(temp2$vw_ret~FF2$ExMkt + FF2$SMB + FF2$HML)$coef[1]
+  table_D2[3,i] <- lm(temp3$vw_ret~FF3$ExMkt + FF3$SMB + FF3$HML)$coef[1]
+}
+
+
+table_D1[,11] <- table_D1[,10] - table_D1[,1]
+colnames(table_D1) <- c("decile 1", "decile 2", "decile 3", "decile 4","decile 5","decile 6","decile 7","decile 8","decile 9","decile 10","spread")
+rownames(table_D1) <- c("1968-1980","1981-1990","1991-2003")
+
+table_D2[,11] <- table_D2[,10] - table_D2[,1]
+colnames(table_D2) <- c("decile 1", "decile 2", "decile 3", "decile 4","decile 5","decile 6","decile 7","decile 8","decile 9","decile 10","spread")
+rownames(table_D2) <- c("1968-1980","1981-1990","1991-2003")
+
+print(table_D1) # ewret
+print(table_D2) # vwret
+
+
+
+
+
+
+
+#----------------------------------------- Additional Table CAPM -----------------------------------------
+
+table_add1 <- table_add2 <- matrix(0,2,11)
+for(i in 1:10){
+  temp1 <- ASSETG_port[ASSETG_decile==i & year %in% c(1968:2003)]
+  temp2 <- ASSETG_port[ASSETG_decile==i & year %in% c(2004:2018)]
+  FF1 <- FF_3_factor[year %in% c(1968:2003)]
+  FF2 <- FF_3_factor[year %in% c(2004:2018)]
+  
+  table_add1[1,i] <- lm(temp1$ew_ret~FF1$ExMkt)$coef[1]
+  table_add1[2,i] <- lm(temp2$ew_ret~FF2$ExMkt)$coef[1]
+  
+  table_add2[1,i] <- lm(temp1$vw_ret~FF1$ExMkt)$coef[1]
+  table_add2[2,i] <- lm(temp2$vw_ret~FF2$ExMkt)$coef[1]
+}
+
+
+table_add1[,11] <- table_add1[,10] - table_add1[,1]
+colnames(table_add1) <- c("decile 1", "decile 2", "decile 3", "decile 4","decile 5","decile 6","decile 7","decile 8","decile 9","decile 10","spread")
+rownames(table_add1) <- c("1968-2003", "2004-2018")
+
+table_add2[,11] <- table_add2[,10] - table_add2[,1]
+colnames(table_add2) <- c("decile 1", "decile 2", "decile 3", "decile 4","decile 5","decile 6","decile 7","decile 8","decile 9","decile 10","spread")
+rownames(table_add2) <- c("1968-2003", "2004-2018")
+
+print(table_add1) # ewret
+print(table_add2) # vwret
+
+
+
+
+
+
+
+
